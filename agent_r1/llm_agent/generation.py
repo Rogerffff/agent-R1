@@ -1,5 +1,65 @@
 """
-Tool generation manager for LLM agents
+==============================================================================
+工具调用生成管理器 (Tool Generation Manager)
+==============================================================================
+
+这是 Agent-R1 的核心生成模块，负责管理 LLM 与工具环境之间的多轮交互。
+
+==============================================================================
+📖 模块概述
+==============================================================================
+
+核心功能：
+1. 管理多轮对话生成循环
+2. 协调 LLM 生成与工具调用
+3. 维护 Action Mask（区分模型生成 vs 环境反馈）
+4. 支持多模态（图像+文本）生成
+
+==============================================================================
+📊 生成流程示例
+==============================================================================
+
+假设用户问题："北京的人口是多少？"
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        多轮工具调用生成流程                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Turn 0 (初始状态):                                                          │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ [System] You have access to search tool...                           │  │
+│  │ [User] 北京的人口是多少？                                              │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│  active_mask = [1, 1, 1, 1]  (4个样本都活跃)                                │
+│                                                                             │
+│  Turn 1 (第一轮生成):                                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ [Assistant] 让我搜索一下北京的人口信息。                                │  │
+│  │ <tool_call>{"name": "search", "arguments": {"query": "北京人口"}}</tool_call>│
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│  action_mask = [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]  (全部是模型生成)             │
+│                                                                             │
+│  Tool 执行:                                                                 │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ <tool_response>北京市2023年常住人口约2185万人...</tool_response>        │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│  action_mask = [...之前的..., 0,0,0,0,0,0,0,0,0,0]  (工具响应部分为0)        │
+│                                                                             │
+│  Turn 2 (第二轮生成):                                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ [Assistant] 根据搜索结果，北京市2023年的常住人口约为2185万人。           │
+│  │ <answer>2185万人</answer>                                              │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│  active_mask = [0, 0, 0, 0]  (检测到 <answer>，停止生成)                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+最终 Action Mask 示意：
+  [Prompt tokens] [Model Gen] [Tool Response] [Model Gen] [Answer]
+        0            1            0              1          1
+  (不计算梯度)   (计算梯度)   (不计算梯度)   (计算梯度)  (计算梯度)
+
+==============================================================================
 """
 
 import torch
@@ -15,18 +75,67 @@ from agent_r1.tool.base import BaseToolEnv, BaseImageToolEnv
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
+
+# ============================================================================
+# 配置类
+# ============================================================================
+
+
 @dataclass
 class ToolGenerationConfig:
-    """Configuration for tool-based generation"""
+    """
+    工具生成配置类。
+
+    属性：
+        max_turns: 最大交互轮数（一次工具调用算一轮）
+        max_prompt_length: 最大 prompt 长度（token 数）
+        max_response_length: 最大响应长度（所有轮次的总长度）
+        max_response_length_single_turn: 单轮最大响应长度
+        use_batch_tool_calls: 是否批量执行工具调用（提高效率）
+
+    示例：
+        config = ToolGenerationConfig(
+            max_turns=5,                      # 最多 5 轮工具调用
+            max_prompt_length=4096,           # prompt 最多 4096 token
+            max_response_length=8192,         # 总响应最多 8192 token
+            max_response_length_single_turn=1024,  # 单轮最多 1024 token
+            use_batch_tool_calls=True         # 批量执行工具
+        )
+    """
+
     max_turns: int
-    max_prompt_length: int 
+    max_prompt_length: int
     max_response_length: int
     max_response_length_single_turn: int
     use_batch_tool_calls: bool = False
-    
+
+
+# ============================================================================
+# 工具生成管理器
+# ============================================================================
+
+
 class ToolGenerationManager:
-    """Manager for handling LLM tool-based generation and interaction"""
-    
+    """
+    工具生成管理器。
+
+    负责管理 LLM 与工具环境之间的多轮交互，是 Agent-R1 生成阶段的核心类。
+
+    主要职责：
+    1. 执行多轮生成循环（run_llm_loop）
+    2. 调用工具并获取响应
+    3. 更新状态（输入序列、注意力掩码等）
+    4. 维护 Action Mask
+
+    属性：
+        tokenizer: HuggingFace tokenizer
+        processor: 多模态处理器（用于 VLM）
+        actor_rollout_wg: Actor/Rollout Worker 组
+        config: 生成配置
+        is_validation: 是否为验证模式
+        tensor_fn: 张量操作辅助类
+    """
+
     def __init__(
         self,
         tokenizer,
@@ -35,46 +144,74 @@ class ToolGenerationManager:
         config: ToolGenerationConfig,
         is_validation: bool = False,
     ):
+        """
+        初始化生成管理器。
+
+        参数：
+            tokenizer: HuggingFace tokenizer，用于文本编码/解码
+            processor: 多模态处理器，用于处理图像（可选）
+            actor_rollout_wg: Actor/Rollout Worker 组，用于生成序列
+            config: ToolGenerationConfig 配置对象
+            is_validation: 是否为验证模式（影响采样策略）
+        """
         self.tokenizer = tokenizer
         self.processor = processor
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
 
-        self.tensor_fn = TensorHelper(TensorConfig(
-            pad_token_id=tokenizer.pad_token_id
-        ))
+        # 初始化张量操作辅助类
+        self.tensor_fn = TensorHelper(TensorConfig(pad_token_id=tokenizer.pad_token_id))
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
-        """Tokenize a batch of responses."""
-        return self.tokenizer(
-            responses, 
-            add_special_tokens=False, 
-            return_tensors='pt', 
-            padding="longest"
-        )['input_ids']
-
-    def _example_level_pad(self, data: Union[List[Any], np.ndarray, torch.Tensor],
-                           active_mask: torch.Tensor,
-                           pad_value: Any = None) -> Union[List[Any], np.ndarray, torch.Tensor]:
-        """Pad data according to active mask.
-        
-        Args:
-            data: Data to be padded. Can be list of any type (str, list, dict, etc.)
-            active_mask: Boolean tensor indicating which positions are active
-            pad_value: Value to use for padding. If None, will use:
-                - Empty string "" for strings
-                - Empty list [] for lists
-                - Empty dict {} for dicts
-                - None for other types
-                
-        Returns:
-            Padded data with same type as input
         """
-        # Get batch size from active mask
+        批量分词。
+
+        将文本列表转换为 token ID 张量，使用最长序列进行填充。
+
+        参数：
+            responses: 文本列表
+
+        返回：
+            input_ids: 形状为 (batch_size, max_length) 的张量
+        """
+        return self.tokenizer(
+            responses, add_special_tokens=False, return_tensors="pt", padding="longest"
+        )["input_ids"]
+
+    def _example_level_pad(
+        self,
+        data: Union[List[Any], np.ndarray, torch.Tensor],
+        active_mask: torch.Tensor,
+        pad_value: Any = None,
+    ) -> Union[List[Any], np.ndarray, torch.Tensor]:
+        """
+        根据 active_mask 进行样本级别的填充。
+
+        在多轮生成中，有些样本可能提前结束（如检测到答案），
+        但我们需要保持批次大小一致，所以用填充值补齐。
+
+        示例：
+            active_mask = [True, False, True, False]  # 4个样本，2个活跃
+            data = ["response1", "response3"]          # 只有2个活跃样本的数据
+
+            结果 = ["response1", "", "response3", ""]  # 填充后的4个样本
+
+        参数：
+            data: 需要填充的数据（可以是字符串、列表、张量等）
+            active_mask: 布尔掩码，指示哪些位置是活跃的
+            pad_value: 填充值，如果为 None 则自动推断：
+                - 字符串 -> ""
+                - 列表 -> []
+                - 张量 -> pad_token_id 填充的张量
+
+        返回：
+            填充后的数据，类型与输入相同
+        """
+        # 获取批次大小
         batch_size = active_mask.shape[0]
-        
-        # Determine pad value if not provided
+
+        # 自动推断填充值
         if pad_value is None:
             if len(data) > 0:
                 first_elem = data[0]
@@ -83,79 +220,154 @@ class ToolGenerationManager:
                 elif isinstance(first_elem, list):
                     pad_value = []
                 elif isinstance(first_elem, torch.Tensor):
-                    pad_value = torch.full_like(first_elem, fill_value=self.tokenizer.pad_token_id, dtype=first_elem.dtype, device=first_elem.device)
+                    pad_value = torch.full_like(
+                        first_elem,
+                        fill_value=self.tokenizer.pad_token_id,
+                        dtype=first_elem.dtype,
+                        device=first_elem.device,
+                    )
                 else:
-                    raise NotImplementedError(f"[WARNING] Unsupported data type: {type(first_elem)}")
-                
-        # Create padded output
+                    raise NotImplementedError(
+                        f"[WARNING] Unsupported data type: {type(first_elem)}"
+                    )
+
+        # 创建填充后的输出
         padded_data = [pad_value] * batch_size
-        
-        # Fill active positions
+
+        # 将活跃位置的数据填入
         s = 0
         for i, is_active in enumerate(active_mask):
             if is_active:
                 padded_data[i] = data[s]
                 s += 1
-        
-        # Convert to numpy array if input was numpy array
+
+        # 转换为相应的数据类型
         if isinstance(data, np.ndarray):
             padded_data = np.array(padded_data, dtype=object)
         elif isinstance(data, torch.Tensor):
             padded_data = torch.stack(padded_data, dim=0)
-            
+
         return padded_data
-    
-    def _create_response_action_mask(self, responses_ids_list: List[List[int]], tool_responses_ids_list: List[List[int]]) -> List[List[int]]:
+
+    def _create_response_action_mask(
+        self,
+        responses_ids_list: List[List[int]],
+        tool_responses_ids_list: List[List[int]],
+    ) -> List[List[int]]:
         """
-        Create action masks for responses identifying which tokens are from the model vs external.
-        
-        Args:
-            responses_ids_list: List of lists containing model's response token IDs
-            tool_responses_ids_list: List of lists containing tool response token IDs
-            
-        Returns:
-            action_masks: List of lists with 1s for model-generated tokens and 0s for external tokens
+        创建响应的 Action Mask。
+
+        Action Mask 用于区分模型生成的 token（需要计算梯度）
+        和工具/环境返回的 token（不需要计算梯度）。
+
+        示例：
+            模型生成: "让我搜索一下<tool_call>..."  -> 15 个 token
+            工具响应: "<tool_response>结果...</tool_response>" -> 10 个 token
+
+            Action Mask = [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0,0,0]
+                          |<------ 模型生成 ------>|  |<-- 工具响应 -->|
+
+        参数：
+            responses_ids_list: 模型生成的 token ID 列表的列表
+            tool_responses_ids_list: 工具响应的 token ID 列表的列表
+
+        返回：
+            action_masks: Action Mask 列表，1 表示模型生成，0 表示外部输入
         """
         action_masks = []
-        
+
         for model_ids, tool_ids in zip(responses_ids_list, tool_responses_ids_list):
-            # Create mask: 1 for model tokens, 0 for tool tokens
+            # 模型生成的 token -> 1，工具响应的 token -> 0
             action_mask = [1] * len(model_ids) + [0] * len(tool_ids)
             action_masks.append(action_mask)
 
         return action_masks
- 
-    def _update_rolling_state(self, rollings, responses_ids: torch.Tensor, 
-                            tool_responses: List[str], tool_responses_images: List[List[Image.Image]]):
+
+    def _update_rolling_state(
+        self,
+        rollings,
+        responses_ids: torch.Tensor,
+        tool_responses: List[str],
+        tool_responses_images: List[List[Image.Image]],
+    ):
+        """
+        更新滚动状态。
+
+        在每轮生成后，将新生成的响应和工具响应追加到当前状态中，
+        同时更新 Action Mask 和其他元数据。
+
+        状态更新示意：
+
+        Turn N 前:
+            input_ids = [Prompt + 之前的响应]
+            responses = [之前的响应]
+            action_mask = [之前的 mask]
+
+        Turn N 后:
+            input_ids = [Prompt + 之前的响应 + 新响应 + 工具响应]
+            responses = [之前的响应 + 新响应 + 工具响应]
+            action_mask = [之前的 mask + 新响应 mask(1) + 工具响应 mask(0)]
+
+        参数：
+            rollings: 当前滚动状态（DataProto 对象）
+            responses_ids: 模型新生成的响应 token ID
+            tool_responses: 工具响应文本列表
+            tool_responses_images: 工具响应图像列表（用于多模态）
+
+        返回：
+            rollings: 更新后的滚动状态
+        """
+        # 检查是否为多模态模式
         is_multi_modal = "multi_modal_data" in rollings.non_tensor_batch.keys()
 
         row_dict_list = []
         formatted_tool_responses = []
         raw_tool_responses = []
         action_masks = []
-        
-        for i, (tool_response, tool_responses_image) in enumerate(zip(tool_responses, tool_responses_images)):
-            row_dict={}
-            if is_multi_modal and '<image>' in tool_response and tool_responses_image is not None:
-                assert len(tool_responses_image) == tool_response.count('<image>'), f"[WARNING] TOOL RESPONSE IMAGE NUMBER NOT MATCH, {len(tool_responses_image)} != {tool_response.count('<image>')} for {tool_response}"
-                raw_tool_responses.append(tool_response.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>'))
-                row_dict['multi_modal_data'] = {'image': tool_responses_image}
-                image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
-                row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
-                image_grid_thw = image_inputs['image_grid_thw']
+
+        # 处理每个样本的工具响应
+        for i, (tool_response, tool_responses_image) in enumerate(
+            zip(tool_responses, tool_responses_images)
+        ):
+            row_dict = {}
+            if (
+                is_multi_modal
+                and "<image>" in tool_response
+                and tool_responses_image is not None
+            ):
+                assert len(tool_responses_image) == tool_response.count(
+                    "<image>"
+                ), f"[WARNING] TOOL RESPONSE IMAGE NUMBER NOT MATCH, {len(tool_responses_image)} != {tool_response.count('<image>')} for {tool_response}"
+                raw_tool_responses.append(
+                    tool_response.replace(
+                        "<image>", "<|vision_start|><|image_pad|><|vision_end|>"
+                    )
+                )
+                row_dict["multi_modal_data"] = {"image": tool_responses_image}
+                image_inputs = self.processor.image_processor(
+                    row_dict["multi_modal_data"]["image"], return_tensors="pt"
+                )
+                row_dict["multi_modal_inputs"] = {
+                    key: val for key, val in image_inputs.items()
+                }
+                image_grid_thw = image_inputs["image_grid_thw"]
                 if image_grid_thw is not None:
                     merge_length = self.processor.image_processor.merge_size**2
                     index = 0
-                    while '<image>' in tool_response:
+                    while "<image>" in tool_response:
                         tool_response = tool_response.replace(
-                            '<image>',
-                            '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) +
-                            '<|vision_end|>',
+                            "<image>",
+                            "<|vision_start|>"
+                            + "<|placeholder|>"
+                            * (image_grid_thw[index].prod() // merge_length)
+                            + "<|vision_end|>",
                             1,
                         )
                         index += 1
 
-                    tool_response = tool_response.replace('<|placeholder|>', self.processor.image_token)
+                    tool_response = tool_response.replace(
+                        "<|placeholder|>", self.processor.image_token
+                    )
 
             else:
                 raw_tool_responses.append(tool_response)
@@ -165,242 +377,473 @@ class ToolGenerationManager:
         tool_responses_ids = self._batch_tokenize(formatted_tool_responses)
 
         if "responses" not in rollings.batch.keys():
-            rollings.batch['responses'] = self.tensor_fn.concatenate_with_padding([
-                responses_ids,
-                tool_responses_ids
-            ], pad_to_left=False)
+            rollings.batch["responses"] = self.tensor_fn.concatenate_with_padding(
+                [responses_ids, tool_responses_ids], pad_to_left=False
+            )
         else:
-            rollings.batch['responses'] = self.tensor_fn.concatenate_with_padding([
-                rollings.batch['responses'],
-                responses_ids,
-                tool_responses_ids
-            ], pad_to_left=False)
+            rollings.batch["responses"] = self.tensor_fn.concatenate_with_padding(
+                [rollings.batch["responses"], responses_ids, tool_responses_ids],
+                pad_to_left=False,
+            )
 
-        rollings.batch['responses'] = rollings.batch['responses'][:, :self.config.max_response_length]
+        rollings.batch["responses"] = rollings.batch["responses"][
+            :, : self.config.max_response_length
+        ]
 
         responses_ids_list = []
         tool_responses_ids_list = []
 
-        for i, (responses_ids_, tool_responses_ids_) in enumerate(zip(responses_ids, tool_responses_ids)):
-            responses_ids_ = responses_ids_[responses_ids_ != self.tokenizer.pad_token_id].tolist()
-            tool_responses_ids_ = tool_responses_ids_[tool_responses_ids_ != self.tokenizer.pad_token_id].tolist()
+        for i, (responses_ids_, tool_responses_ids_) in enumerate(
+            zip(responses_ids, tool_responses_ids)
+        ):
+            responses_ids_ = responses_ids_[
+                responses_ids_ != self.tokenizer.pad_token_id
+            ].tolist()
+            tool_responses_ids_ = tool_responses_ids_[
+                tool_responses_ids_ != self.tokenizer.pad_token_id
+            ].tolist()
             responses_ids_list.append(responses_ids_)
             tool_responses_ids_list.append(tool_responses_ids_)
 
-        action_masks = self._create_response_action_mask(responses_ids_list, tool_responses_ids_list)
+        action_masks = self._create_response_action_mask(
+            responses_ids_list, tool_responses_ids_list
+        )
 
         if "action_mask" not in rollings.non_tensor_batch.keys():
-            rollings.non_tensor_batch['action_mask'] = np.array(action_masks, dtype=object)
+            rollings.non_tensor_batch["action_mask"] = np.array(
+                action_masks, dtype=object
+            )
         else:
             new_action_masks = []
-            for i, action_mask in enumerate(rollings.non_tensor_batch['action_mask']):
+            for i, action_mask in enumerate(rollings.non_tensor_batch["action_mask"]):
                 new_action_masks.append(action_mask + action_masks[i])
-            rollings.non_tensor_batch['action_mask'] = np.array(new_action_masks, dtype=object)
+            rollings.non_tensor_batch["action_mask"] = np.array(
+                new_action_masks, dtype=object
+            )
 
-        new_input_ids = self.tensor_fn.concatenate_with_padding([
-            rollings.batch['input_ids'],
-            responses_ids,
-            tool_responses_ids
-        ])
+        new_input_ids = self.tensor_fn.concatenate_with_padding(
+            [rollings.batch["input_ids"], responses_ids, tool_responses_ids]
+        )
 
         new_attention_mask = self.tensor_fn.create_attention_mask(new_input_ids)
-        
+
         if is_multi_modal:
-            multi_modal_data = rollings.non_tensor_batch['multi_modal_data']
-            multi_modal_inputs = rollings.non_tensor_batch['multi_modal_inputs']
+            multi_modal_data = rollings.non_tensor_batch["multi_modal_data"]
+            multi_modal_inputs = rollings.non_tensor_batch["multi_modal_inputs"]
 
             new_multi_modal_data = []
             new_multi_modal_inputs = []
 
-            for row_dict, multi_modal_data_, multi_modal_inputs_ in zip(row_dict_list, multi_modal_data, multi_modal_inputs):
-                if 'multi_modal_data' in row_dict.keys():
-                    new_multi_modal_data.append({"image":multi_modal_data_['image'] + row_dict['multi_modal_data']['image']})
+            for row_dict, multi_modal_data_, multi_modal_inputs_ in zip(
+                row_dict_list, multi_modal_data, multi_modal_inputs
+            ):
+                if "multi_modal_data" in row_dict.keys():
+                    new_multi_modal_data.append(
+                        {
+                            "image": multi_modal_data_["image"]
+                            + row_dict["multi_modal_data"]["image"]
+                        }
+                    )
                 else:
-                    new_multi_modal_data.append({"image":multi_modal_data_['image']})
-                if 'multi_modal_inputs' in row_dict.keys():
-                    new_multi_modal_inputs.append({key: torch.cat((val,row_dict['multi_modal_inputs'][key]),dim=0) for key, val in multi_modal_inputs_.items()})
+                    new_multi_modal_data.append({"image": multi_modal_data_["image"]})
+                if "multi_modal_inputs" in row_dict.keys():
+                    new_multi_modal_inputs.append(
+                        {
+                            key: torch.cat(
+                                (val, row_dict["multi_modal_inputs"][key]), dim=0
+                            )
+                            for key, val in multi_modal_inputs_.items()
+                        }
+                    )
                 else:
-                    new_multi_modal_inputs.append({key: val for key, val in multi_modal_inputs_.items()})
+                    new_multi_modal_inputs.append(
+                        {key: val for key, val in multi_modal_inputs_.items()}
+                    )
 
-            rollings.non_tensor_batch['multi_modal_data'] = np.array(new_multi_modal_data, dtype=object)
-            rollings.non_tensor_batch['multi_modal_inputs'] = np.array(new_multi_modal_inputs, dtype=object)
+            rollings.non_tensor_batch["multi_modal_data"] = np.array(
+                new_multi_modal_data, dtype=object
+            )
+            rollings.non_tensor_batch["multi_modal_inputs"] = np.array(
+                new_multi_modal_inputs, dtype=object
+            )
 
             from verl.models.transformers.qwen2_vl import get_rope_index
+
             new_postion_ids = []
             for i in range(len(new_multi_modal_data)):
-                new_postion_ids.append(get_rope_index(
-                    processor=self.processor,
-                    input_ids=new_input_ids[i],
-                    image_grid_thw=new_multi_modal_inputs[i]['image_grid_thw'],
-                    attention_mask=new_attention_mask[i],
-                ))
+                new_postion_ids.append(
+                    get_rope_index(
+                        processor=self.processor,
+                        input_ids=new_input_ids[i],
+                        image_grid_thw=new_multi_modal_inputs[i]["image_grid_thw"],
+                        attention_mask=new_attention_mask[i],
+                    )
+                )
 
             new_position_ids = torch.stack(new_postion_ids, dim=0)
         else:
             new_position_ids = self.tensor_fn.create_position_ids(new_attention_mask)
 
-        rollings.batch['input_ids'] = new_input_ids
-        rollings.batch['position_ids'] = new_position_ids
-        rollings.batch['attention_mask'] = new_attention_mask
+        rollings.batch["input_ids"] = new_input_ids
+        rollings.batch["position_ids"] = new_position_ids
+        rollings.batch["attention_mask"] = new_attention_mask
 
-        raw_prompt_ids = rollings.non_tensor_batch['raw_prompt_ids'].tolist()
+        raw_prompt_ids = rollings.non_tensor_batch["raw_prompt_ids"].tolist()
         new_raw_prompt_ids = []
 
-        for raw_prompt_id, responses_ids_, raw_tool_response in zip(raw_prompt_ids, responses_ids_list, raw_tool_responses):
+        for raw_prompt_id, responses_ids_, raw_tool_response in zip(
+            raw_prompt_ids, responses_ids_list, raw_tool_responses
+        ):
             if len(responses_ids_) > 0 or len(raw_tool_response) > 0:
-                tool_response_ids = self.tokenizer.encode(raw_tool_response, add_special_tokens=False)
-                new_raw_prompt_ids.append(raw_prompt_id + responses_ids_ + tool_response_ids)
+                tool_response_ids = self.tokenizer.encode(
+                    raw_tool_response, add_special_tokens=False
+                )
+                new_raw_prompt_ids.append(
+                    raw_prompt_id + responses_ids_ + tool_response_ids
+                )
             else:
                 new_raw_prompt_ids.append(raw_prompt_id)
 
-        rollings.non_tensor_batch['raw_prompt_ids'] = np.array(new_raw_prompt_ids, dtype=object)
+        rollings.non_tensor_batch["raw_prompt_ids"] = np.array(
+            new_raw_prompt_ids, dtype=object
+        )
 
         return rollings
-    
-    def run_llm_loop(self, gen_batch, env: Union[BaseToolEnv, BaseImageToolEnv]) -> Tuple[Dict, Dict]:
-        """Run main LLM generation loop."""
 
-        batch_size = gen_batch.batch['input_ids'].shape[0]
-        
+    def run_llm_loop(
+        self, gen_batch, env: Union[BaseToolEnv, BaseImageToolEnv]
+    ) -> DataProto:
+        """
+        执行 LLM 多轮生成主循环。
+
+        这是 Agent-R1 生成阶段的核心方法，实现了 LLM 与工具环境之间的
+        多轮交互循环。
+
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │                        run_llm_loop 流程图                           │
+        ├─────────────────────────────────────────────────────────────────────┤
+        │                                                                     │
+        │  输入: gen_batch (包含 prompt 的 DataProto)                          │
+        │        env (工具环境)                                               │
+        │                                                                     │
+        │  for turn in range(max_turns):                                      │
+        │      │                                                              │
+        │      ├─► 1. 检查序列长度是否超限                                      │
+        │      │      - 超限的样本设为不活跃                                    │
+        │      │                                                              │
+        │      ├─► 2. 筛选活跃样本                                             │
+        │      │      - 只对 active_mask=True 的样本继续生成                    │
+        │      │                                                              │
+        │      ├─► 3. 调用 actor_rollout_wg.generate_sequences()              │
+        │      │      - 分布式生成响应                                         │
+        │      │                                                              │
+        │      ├─► 4. 调用 env.step() 执行工具                                 │
+        │      │      - 解析工具调用                                           │
+        │      │      - 执行工具并获取响应                                      │
+        │      │      - 返回是否继续生成的标志                                  │
+        │      │                                                              │
+        │      ├─► 5. 更新 active_mask                                        │
+        │      │      - 检测到答案或达到终止条件的样本设为不活跃                  │
+        │      │                                                              │
+        │      └─► 6. 更新滚动状态 (_update_rolling_state)                    │
+        │             - 追加响应和工具输出到序列                                │
+        │             - 更新 action_mask                                      │
+        │                                                                     │
+        │  输出: final_output (包含完整生成结果的 DataProto)                   │
+        │        - prompts: 原始 prompt                                       │
+        │        - responses: 完整响应（含工具输出）                            │
+        │        - action_mask: 区分模型生成 vs 环境反馈                       │
+        │        - turns: 每个样本的轮数                                       │
+        │                                                                     │
+        └─────────────────────────────────────────────────────────────────────┘
+
+        ============================================================================
+        输入说明
+        ============================================================================
+
+        gen_batch (DataProto): 生成批次数据
+            - batch['input_ids']: 输入 token ID，形状 (batch_size, seq_len)
+            - batch['attention_mask']: 注意力掩码
+            - batch['position_ids']: 位置编码
+            - non_tensor_batch['raw_prompt_ids']: 原始 prompt ID 列表
+            - non_tensor_batch['reward_model']: 奖励模型相关信息
+            - meta_info: 元信息（采样参数等）
+
+        env (BaseToolEnv): 工具环境
+            - step(response) -> (tool_response, reward, active)
+            - 解析响应中的工具调用
+            - 执行工具并返回结果
+
+        ============================================================================
+        输出说明
+        ============================================================================
+
+        final_output (DataProto): 最终输出
+            - batch['prompts']: 原始 prompt，形状 (batch_size, prompt_len)
+            - batch['responses']: 完整响应，形状 (batch_size, response_len)
+            - batch['input_ids']: 完整序列 = prompts + responses
+            - batch['attention_mask']: 完整序列的注意力掩码
+            - batch['position_ids']: 完整序列的位置编码
+            - batch['action_mask']: Action Mask，1=模型生成，0=环境反馈
+            - batch['turns']: 每个样本的交互轮数
+            - non_tensor_batch: 非张量数据（ground_truth 等）
+
+        ============================================================================
+        具体示例
+        ============================================================================
+
+        假设 batch_size=2, max_turns=3:
+
+        样本 0 (2 轮后停止):
+            Turn 1: "搜索北京人口<tool_call>..." -> 工具返回结果 -> 继续
+            Turn 2: "根据结果，答案是...<answer>2185万</answer>" -> 停止
+
+        样本 1 (1 轮后停止):
+            Turn 1: "这是个简单问题，答案是...<answer>42</answer>" -> 停止
+
+        active_num_list = [2, 2, 1, 0]  # 初始2个 -> Turn1后2个 -> Turn2后1个 -> 结束
+        turns = [2, 1]  # 样本0用了2轮，样本1用了1轮
+
+        Action Mask (样本 0):
+            [Model Gen Turn1] [Tool Response] [Model Gen Turn2]
+                  1...1           0...0           1...1
+
+        ============================================================================
+        """
+        # ====================================================================
+        # 初始化
+        # ====================================================================
+        batch_size = gen_batch.batch["input_ids"].shape[0]
+
+        # active_mask: 标记哪些样本仍需要继续生成
+        # True = 继续生成, False = 已完成
         active_mask = torch.ones(batch_size, dtype=torch.bool)
+
+        # turns: 记录每个样本的交互轮数
         turns = torch.zeros(batch_size, dtype=torch.int32)
+
+        # 记录每轮活跃样本数（用于调试）
         active_num_list = [active_mask.sum().item()]
+
+        # rollings: 滚动状态，每轮更新
         rollings = gen_batch
         meta_info = gen_batch.meta_info
-        prompts = gen_batch.batch['input_ids'][:, -self.config.max_prompt_length:].clone()
 
-        # Main generation loop
+        # 保存原始 prompt（用于最终输出）
+        prompts = gen_batch.batch["input_ids"][
+            :, -self.config.max_prompt_length :
+        ].clone()
+
+        # ====================================================================
+        # 主生成循环
+        # ====================================================================
         for _ in range(self.config.max_turns):
+            # 如果没有活跃样本，提前退出
             if not active_mask.sum():
                 break
 
-            # Check if any sequence exceeds max length
-            effective_len = rollings.batch['attention_mask'].sum(dim=1)
+            # ================================================================
+            # 步骤 1: 检查序列长度是否超限
+            # ================================================================
+            effective_len = rollings.batch["attention_mask"].sum(dim=1)
             length_exceeded = effective_len > self.config.max_prompt_length
 
             if length_exceeded.sum() > 0:
                 print("[WARNING] SEQUENCE LENGTH EXCEEDED MAX PROMPT LENGTH")
                 active_mask[length_exceeded] = 0
 
-            raw_prompt_ids = rollings.non_tensor_batch['raw_prompt_ids']
-            length_exceeded = [len(prompt_id) > self.config.max_prompt_length for prompt_id in raw_prompt_ids]
+            # 检查 raw_prompt_ids 长度
+            raw_prompt_ids = rollings.non_tensor_batch["raw_prompt_ids"]
+            length_exceeded = [
+                len(prompt_id) > self.config.max_prompt_length
+                for prompt_id in raw_prompt_ids
+            ]
             if any(length_exceeded):
                 print("[WARNING] SEQUENCE LENGTH EXCEEDED MAX PROMPT LENGTH")
                 for prompt_id, length_exceeded_ in zip(raw_prompt_ids, length_exceeded):
                     if length_exceeded_:
-                        print(f"[DEBUG] LENGTH {len(prompt_id)}: {self.tokenizer.decode(prompt_id)}")
+                        print(
+                            f"[DEBUG] LENGTH {len(prompt_id)}: {self.tokenizer.decode(prompt_id)}"
+                        )
                 active_mask[length_exceeded] = 0
-            
+
             if not active_mask.sum():
                 print("[WARNING] NO ACTIVE SEQUENCES")
                 break
-            
-            if hasattr(rollings, 'non_tensor_batch') and rollings.non_tensor_batch:
-                # Create active batch with tensor data
+
+            # ================================================================
+            # 步骤 2: 筛选活跃样本
+            # ================================================================
+            # 只对 active_mask=True 的样本继续生成，节省计算资源
+            if hasattr(rollings, "non_tensor_batch") and rollings.non_tensor_batch:
                 rollings_active = DataProto.from_dict(
-                    tensors={
-                        k: v[active_mask] for k, v in rollings.batch.items()
-                    },
+                    tensors={k: v[active_mask] for k, v in rollings.batch.items()},
                     non_tensors={
-                        k: v[active_mask.numpy()] for k, v in rollings.non_tensor_batch.items()
+                        k: v[active_mask.numpy()]
+                        for k, v in rollings.non_tensor_batch.items()
                     },
-                    meta_info=meta_info
+                    meta_info=meta_info,
                 )
             else:
                 rollings_active = DataProto.from_dict(
-                    tensors={
-                        k: v[active_mask] for k, v in rollings.batch.items()
-                    },
-                    meta_info=meta_info
+                    tensors={k: v[active_mask] for k, v in rollings.batch.items()},
+                    meta_info=meta_info,
                 )
 
-            rollings_active, pad_size = pad_dataproto_to_divisor(rollings_active, self.actor_rollout_wg.world_size)
+            # ================================================================
+            # 步骤 3: 分布式生成响应
+            # ================================================================
+            # 填充到 world_size 的整数倍（分布式数据并行需要）
+            rollings_active, pad_size = pad_dataproto_to_divisor(
+                rollings_active, self.actor_rollout_wg.world_size
+            )
+
+            # 调用 Actor Worker 生成序列
             gen_output = self.actor_rollout_wg.generate_sequences(rollings_active)
+
+            # 去除填充
             gen_output = unpad_dataproto(gen_output, pad_size=pad_size)
 
-            raw_responses_ids = gen_output.batch['responses']
+            # ================================================================
+            # 步骤 4: 执行工具调用
+            # ================================================================
+            # 获取生成的响应
+            raw_responses_ids = gen_output.batch["responses"]
             responses_ids = env.process_responses_ids(self.tokenizer, raw_responses_ids)
-            raw_responses = self.tokenizer.batch_decode(responses_ids, skip_special_tokens=True)
+            raw_responses = self.tokenizer.batch_decode(
+                responses_ids, skip_special_tokens=True
+            )
+
+            # 根据环境类型执行工具
             if isinstance(env, BaseToolEnv):
+                # 文本工具环境
                 if self.config.use_batch_tool_calls:
+                    # 批量执行工具调用（更高效）
                     tool_responses, _, new_active_masks = env.batch_step(raw_responses)
                 else:
+                    # 逐个执行工具调用
                     tool_responses = []
                     new_active_masks = []
                     for raw_response in raw_responses:
                         tool_response, _, active = env.step(raw_response)
                         tool_responses.append(tool_response)
                         new_active_masks.append(active)
-                tool_images = [[]] * len(raw_responses)
+                tool_images = [[]] * len(raw_responses)  # 文本环境无图像
+
             elif isinstance(env, BaseImageToolEnv):
+                # 多模态工具环境（支持图像输出）
                 if self.config.use_batch_tool_calls:
-                    tool_responses, tool_images, _, new_active_masks = env.batch_step(raw_responses)
+                    tool_responses, tool_images, _, new_active_masks = env.batch_step(
+                        raw_responses
+                    )
                 else:
                     tool_responses = []
                     tool_images = []
                     new_active_masks = []
                     for raw_response in raw_responses:
-                        assistant_message, tool_message, tool_image, success, stop = env.step(raw_response)
+                        assistant_message, tool_message, tool_image, success, stop = (
+                            env.step(raw_response)
+                        )
                         tool_responses.append(tool_message)
                         tool_images.append(tool_image)
                         new_active_masks.append(stop)
 
+            # ================================================================
+            # 步骤 5: 填充并更新 active_mask
+            # ================================================================
+            # 将活跃样本的数据填充回完整批次
             responses_ids = self._example_level_pad(responses_ids, active_mask)
-            tool_responses = self._example_level_pad(tool_responses, active_mask, pad_value="")
-            tool_images = self._example_level_pad(tool_images, active_mask, pad_value=[])
+            tool_responses = self._example_level_pad(
+                tool_responses, active_mask, pad_value=""
+            )
+            tool_images = self._example_level_pad(
+                tool_images, active_mask, pad_value=[]
+            )
 
-            active_mask[active_mask.clone()] = torch.tensor(new_active_masks, dtype=torch.bool)
+            # 更新 active_mask：只更新当前活跃的位置
+            # new_active_masks: True=继续生成, False=停止（检测到答案等）
+            active_mask[active_mask.clone()] = torch.tensor(
+                new_active_masks, dtype=torch.bool
+            )
 
+            # 增加仍活跃样本的轮数计数
             turns[active_mask] += 1
 
             active_num_list.append(active_mask.sum().item())
 
-            # Update states
+            # ================================================================
+            # 步骤 6: 更新滚动状态
+            # ================================================================
+            # 将新生成的响应和工具响应追加到序列中
             rollings = self._update_rolling_state(
-                rollings,
-                responses_ids,
-                tool_responses,
-                tool_images
+                rollings, responses_ids, tool_responses, tool_images
             )
- 
+
         print("ACTIVE_TRAJ_NUM:", active_num_list)
 
-        # Compose final output
+        # ====================================================================
+        # 组装最终输出
+        # ====================================================================
         final_output = {}
-        final_output['turns'] = turns
-        final_output['prompts'] = prompts
-        final_output['responses'] = rollings.batch['responses'].long()
-        final_output['input_ids'] = torch.cat([
-            prompts,
-            rollings.batch['responses'].long()
-        ], dim=1)
-        final_output['attention_mask'] = self.tensor_fn.create_attention_mask(final_output['input_ids'])
+
+        # 基本输出
+        final_output["turns"] = turns  # 每个样本的轮数
+        final_output["prompts"] = prompts  # 原始 prompt
+        final_output["responses"] = rollings.batch["responses"].long()  # 完整响应
+
+        # 组合完整序列
+        final_output["input_ids"] = torch.cat(
+            [prompts, rollings.batch["responses"].long()], dim=1
+        )
+
+        # 创建注意力掩码
+        final_output["attention_mask"] = self.tensor_fn.create_attention_mask(
+            final_output["input_ids"]
+        )
+
+        # 创建位置编码（多模态需要特殊处理）
         if "multi_modal_data" in rollings.non_tensor_batch.keys():
             from verl.models.transformers.qwen2_vl import get_rope_index
+
             position_ids = []
-            for i in range(len(rollings.non_tensor_batch['multi_modal_data'])):
-                position_ids.append(get_rope_index(
-                    processor=self.processor,
-                    input_ids=final_output['input_ids'][i],
-                    image_grid_thw=rollings.non_tensor_batch['multi_modal_inputs'][i]['image_grid_thw'],
-                    attention_mask=final_output['attention_mask'][i],
-                ))
+            for i in range(len(rollings.non_tensor_batch["multi_modal_data"])):
+                position_ids.append(
+                    get_rope_index(
+                        processor=self.processor,
+                        input_ids=final_output["input_ids"][i],
+                        image_grid_thw=rollings.non_tensor_batch["multi_modal_inputs"][
+                            i
+                        ]["image_grid_thw"],
+                        attention_mask=final_output["attention_mask"][i],
+                    )
+                )
 
             position_ids = torch.stack(position_ids, dim=0)
-            final_output['position_ids'] = position_ids
+            final_output["position_ids"] = position_ids
         else:
-            final_output['position_ids'] = self.tensor_fn.create_position_ids(final_output['attention_mask'])
+            final_output["position_ids"] = self.tensor_fn.create_position_ids(
+                final_output["attention_mask"]
+            )
 
-        response_length = final_output['responses'].shape[-1]
-        response_mask = final_output['attention_mask'][:, -response_length:]
+        # ====================================================================
+        # 创建最终的 Action Mask
+        # ====================================================================
+        response_length = final_output["responses"].shape[-1]
+        response_mask = final_output["attention_mask"][:, -response_length:]
 
-        final_output['action_mask'] = response_mask.clone()
+        # 初始化为全 1（默认所有 token 都是模型生成）
+        final_output["action_mask"] = response_mask.clone()
 
-        for i, action_mask in enumerate(rollings.non_tensor_batch['action_mask']):
+        # 应用实际的 action_mask（将工具响应部分设为 0）
+        for i, action_mask in enumerate(rollings.non_tensor_batch["action_mask"]):
             mask_len = min(len(action_mask), response_mask.shape[1])
-            final_output['action_mask'][i, :mask_len] = torch.tensor(action_mask[:mask_len]) * response_mask[i, :mask_len]
-        
+            # 注意：需要同时考虑 action_mask 和 response_mask（padding 位置）
+            final_output["action_mask"][i, :mask_len] = (
+                torch.tensor(action_mask[:mask_len]) * response_mask[i, :mask_len]
+            )
+
+        # 封装为 DataProto 并返回
         final_output = DataProto.from_dict(final_output)
         final_output.non_tensor_batch = rollings.non_tensor_batch
-        
+
         return final_output

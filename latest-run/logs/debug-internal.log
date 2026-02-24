@@ -1,0 +1,7 @@
+{"time":"2026-01-23T11:57:57.215829305Z","level":"INFO","msg":"stream: starting","core version":"0.24.0"}
+{"time":"2026-01-23T11:57:57.627942315Z","level":"INFO","msg":"stream: created new stream","id":"lradqz4p"}
+{"time":"2026-01-23T11:57:57.628057233Z","level":"INFO","msg":"handler: started","stream_id":"lradqz4p"}
+{"time":"2026-01-23T11:57:57.628325273Z","level":"INFO","msg":"stream: started","id":"lradqz4p"}
+{"time":"2026-01-23T11:57:57.628581518Z","level":"INFO","msg":"writer: started","stream_id":"lradqz4p"}
+{"time":"2026-01-23T11:57:57.628676537Z","level":"INFO","msg":"sender: started","stream_id":"lradqz4p"}
+{"time":"2026-01-23T19:17:43.420813874Z","level":"INFO","msg":"api: retrying HTTP error","status":502,"url":"https://api.wandb.ai/files/jufangjian-the-university-of-sydney/retool/lradqz4p/file_stream","body":"\n<html><head>\n<meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n<title>502 Server Error</title>\n</head>\n<body text=#000000 bgcolor=#ffffff>\n<h1>Error: Server Error</h1>\n<h2>The server encountered a temporary error and could not complete your request.<p>Please try again in 30 seconds.</h2>\n<h2></h2>\n</body></html>\n"}

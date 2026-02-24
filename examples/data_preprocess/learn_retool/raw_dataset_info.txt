@@ -1,0 +1,36 @@
+正在加载数据集...
+
+============================================================
+数据集基本信息
+============================================================
+分割: ['train']
+训练集大小: 17917
+字段: ['prompt', 'target']
+
+============================================================
+字段类型
+============================================================
+  prompt: Value('string')
+  target: Value('string')
+
+============================================================
+前 3 条数据示例
+============================================================
+
+--- 第 1 条数据 ---
+prompt: In triangle $ABC$, $\sin \angle A = \frac{4}{5}$ and $\angle A < 90^\circ$. Let $D$ be a point outside triangle $ABC$ such that $\angle BAD = \angle DAC$ and $\angle BDC = 90^\circ$. Suppose that $AD = 1$ and that $\frac{BD}{CD} = \frac{3}{2}$. If $AB + AC$ can be expressed in the form $\frac{a\sqrt{b}}{c}$ where $a, b, c$ are pairwise relatively prime integers, find $a + b + c$.
+target: 34
+
+--- 第 2 条数据 ---
+prompt: Let $ABCD$ be a unit square in the plane. Points $X$ and $Y$ are chosen independently and uniformly at random on the perimeter of $ABCD$. If the expected value of the area of triangle $\triangle AXY$ can be expressed as $\frac{m}{n}$ for relatively prime positive integers $m$ and $n$, compute $m+n$.
+target: 113
+
+--- 第 3 条数据 ---
+prompt: Let $a, b, c$ be distinct numbers such that the equations $x^2 + ax + 1 = 0$ and $x^2 + bx + c = 0$ have a common real root, and the equations $x^2 + x + a = 0$ and $x^2 + cx + b = 0$ also have a common real root. Compute the sum $a + b + c$.
+target: -3
+
+============================================================
+统计信息
+============================================================
+prompt 长度 - 最小: 19, 最大: 3190, 平均: 255.9
+target 长度 - 最小: 1, 最大: 23, 平均: 2.3

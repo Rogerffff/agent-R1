@@ -2,7 +2,10 @@
 
 **Clone the repository**
 ```bash
+# 官方仓库
 git clone https://github.com/0russwest0/Agent-R1.git
+# 或使用你自己的 fork/仓库
+# git clone https://github.com/YOUR_USERNAME/Agent-R1.git
 cd Agent-R1
 ```
 

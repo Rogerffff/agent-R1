@@ -1,0 +1,124 @@
+============================================================
+ReTool 处理后数据集查看工具
+============================================================
+
+============================================================
+训练集 - ./data/retool/train.parquet
+============================================================
+记录数: 17817
+字段: ['prompt', 'target', 'data_source', 'ability', 'reward_model', 'extra_info']
+
+============================================================
+测试集 - ./data/retool/test.parquet
+============================================================
+记录数: 100
+字段: ['prompt', 'target', 'data_source', 'ability', 'reward_model', 'extra_info']
+
+============================================================
+数据结构说明
+============================================================
+
+字段说明:
+  - prompt: 消息列表，包含 role 和 content
+    - role: "user"
+    - content: 包含完整指令和问题的文本
+  - target: 原始答案
+  - data_source: 数据来源标识
+  - ability: 能力分类（可为空）
+  - reward_model: 奖励模型配置
+    - style: "rule" (规则评分)
+    - ground_truth: 正确答案
+  - extra_info: 额外信息
+    - split: 数据分割 (train/test)
+    - index: 数据索引
+
+
+============================================================
+训练集数据示例
+============================================================
+
+--- 第 1 条数据 ---
+
+prompt:
+[
+  {
+    "content": "Solve the following problem step by step. You now have the ability to selectively write executable Python code to enhance your reasoning process. The Python code will be executed by an external sandbox, and the output (wrapped in `<interpreter>output_str</interpreter>`) can be returned to aid your reasoning and help you arrive at the final answer. The Python code should be complete scripts, including necessary imports. \nEach code snippet is wrapped with `<code>\n```python\ncode snippet\n```\n</code>`.\nThe last part of your response should be in the following format:\n<answer>\n\\boxed{'The final answer goes here.'}\n</answer>\n\n*user question:*\nLet $n$ be a positive integer. Let $B_{n}$ be the set of all binary strings of length $n$. For a binary string $s_{1} s_{2} \\ldots s_{n}$, we define its twist in the following way. First, we count how many blocks of consecutive digits it has. Denote this number by $b$. Then, we replace $s_{b}$ with $1-s_{b}$. A string $a$ is said to be a descendant of $b$ if $a$ can be obtained from $b$ through a finite number of twists. A subset of $B_{n}$ is called divided if no two of its members have a common descendant. Find the largest possible cardinality of a divided subset of $B_{n}$. Please provide the value when $n = 4$. The answer should be an integer.\n\nRemember to place the final answer in the last part using the format: \n<answer>\n\\boxed{'The final answer goes here.'}\n</answer>",
+    "role": "user"
+  }
+]
+
+target:
+  4
+
+data_source:
+  BytedTsinghua-SIA/DAPO-Math-17k
+
+ability:
+  
+
+reward_model:
+{
+  "ground_truth": "4",
+  "style": "rule"
+}
+
+extra_info:
+{
+  "index": 0,
+  "split": "train"
+}
+
+============================================================
+测试集数据示例
+============================================================
+
+--- 第 1 条数据 ---
+
+prompt:
+[
+  {
+    "content": "Solve the following problem step by step. You now have the ability to selectively write executable Python code to enhance your reasoning process. The Python code will be executed by an external sandbox, and the output (wrapped in `<interpreter>output_str</interpreter>`) can be returned to aid your reasoning and help you arrive at the final answer. The Python code should be complete scripts, including necessary imports. \nEach code snippet is wrapped with `<code>\n```python\ncode snippet\n```\n</code>`.\nThe last part of your response should be in the following format:\n<answer>\n\\boxed{'The final answer goes here.'}\n</answer>\n\n*user question:*\nFind the number of positive integers $k \\leq 2018$ for which there exist integers $m$ and $n$ such that $k = 2^m + 2^n$. For example, $64 = 2^5 + 2^5$, $65 = 2^0 + 2^6$, and $66 = 2^1 + 2^6$.\n\nRemember to place the final answer in the last part using the format: \n<answer>\n\\boxed{'The final answer goes here.'}\n</answer>",
+    "role": "user"
+  }
+]
+
+target:
+  65
+
+data_source:
+  BytedTsinghua-SIA/DAPO-Math-17k
+
+ability:
+  
+
+reward_model:
+{
+  "ground_truth": "65",
+  "style": "rule"
+}
+
+extra_info:
+{
+  "index": 0,
+  "split": "train"
+}
+
+============================================================
+使用 Pandas 进行数据分析
+============================================================
+
+DataFrame 形状: (17817, 6)
+
+列类型:
+prompt          object
+target          object
+data_source     object
+ability         object
+reward_model    object
+extra_info      object
+dtype: object
+
+ground_truth 长度统计:
+  最小: 1
+  最大: 23
+  平均: 2.3

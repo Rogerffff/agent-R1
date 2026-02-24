@@ -29,7 +29,8 @@ class SearchTool(BaseTool):
         # Get the absolute path to the data directory
         current_dir = os.path.dirname(os.path.abspath(__file__))
         # data_dir = os.path.abspath(os.path.join(current_dir, "../../../data/corpus/hotpotqa"))
-        data_dir = os.path.abspath(os.path.join(current_dir, "/home/yanruiran/workspace/Agent-R1/data/corpus/hotpotqa"))
+        # data_dir = os.path.abspath(os.path.join(current_dir, "/home/yanruiran/workspace/Agent-R1/data/corpus/hotpotqa"))
+        data_dir = os.path.abspath(os.path.join(current_dir, "../../../data/corpus/hotpotqa"))
         
         # Load index and corpus using absolute paths
         self.index = faiss.read_index(os.path.join(data_dir, "index.bin"))
